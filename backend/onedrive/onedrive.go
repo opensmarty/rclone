@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,19 +24,17 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/rclone/rclone/fs/encodings"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/oauth2"
 )
-
-const enc = encodings.OneDrive
 
 const (
 	rcloneClientID              = "b15665d9-eda6-4092-8539-0eec376afd59"
@@ -61,7 +60,7 @@ var (
 			AuthURL:  "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
 			TokenURL: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
 		},
-		Scopes:       []string{"Files.Read", "Files.ReadWrite", "Files.Read.All", "Files.ReadWrite.All", "offline_access"},
+		Scopes:       []string{"Files.Read", "Files.ReadWrite", "Files.Read.All", "Files.ReadWrite.All", "offline_access", "Sites.Read.All"},
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectLocalhostURL,
@@ -252,16 +251,63 @@ delete OneNote files or otherwise want them to show up in directory
 listing, set this option.`,
 			Default:  false,
 			Advanced: true,
+		}, {
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			// List of replaced characters:
+			//   < (less than)     -> '＜' // FULLWIDTH LESS-THAN SIGN
+			//   > (greater than)  -> '＞' // FULLWIDTH GREATER-THAN SIGN
+			//   : (colon)         -> '：' // FULLWIDTH COLON
+			//   " (double quote)  -> '＂' // FULLWIDTH QUOTATION MARK
+			//   \ (backslash)     -> '＼' // FULLWIDTH REVERSE SOLIDUS
+			//   | (vertical line) -> '｜' // FULLWIDTH VERTICAL LINE
+			//   ? (question mark) -> '？' // FULLWIDTH QUESTION MARK
+			//   * (asterisk)      -> '＊' // FULLWIDTH ASTERISK
+			//   # (number sign)  -> '＃'  // FULLWIDTH NUMBER SIGN
+			//   % (percent sign) -> '％'  // FULLWIDTH PERCENT SIGN
+			//
+			// Folder names cannot begin with a tilde ('~')
+			// List of replaced characters:
+			//   ~ (tilde)        -> '～'  // FULLWIDTH TILDE
+			//
+			// Additionally names can't begin with a space ( ) or end with a period (.) or space ( ).
+			// List of replaced characters:
+			//   . (period)        -> '．' // FULLWIDTH FULL STOP
+			//     (space)         -> '␠'  // SYMBOL FOR SPACE
+			//
+			// Also encode invalid UTF-8 bytes as json doesn't handle them.
+			//
+			// The OneDrive API documentation lists the set of reserved characters, but
+			// testing showed this list is incomplete. This are the differences:
+			//  - " (double quote) is rejected, but missing in the documentation
+			//  - space at the end of file and folder names is rejected, but missing in the documentation
+			//  - period at the end of file names is rejected, but missing in the documentation
+			//
+			// Adding these restrictions to the OneDrive API documentation yields exactly
+			// the same rules as the Windows naming conventions.
+			//
+			// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/concepts/addressing-driveitems?view=odsp-graph-online#path-encoding
+			Default: (encoder.Display |
+				encoder.EncodeBackSlash |
+				encoder.EncodeHashPercent |
+				encoder.EncodeLeftSpace |
+				encoder.EncodeLeftTilde |
+				encoder.EncodeRightPeriod |
+				encoder.EncodeRightSpace |
+				encoder.EncodeWin |
+				encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	ChunkSize          fs.SizeSuffix `config:"chunk_size"`
-	DriveID            string        `config:"drive_id"`
-	DriveType          string        `config:"drive_type"`
-	ExposeOneNoteFiles bool          `config:"expose_onenote_files"`
+	ChunkSize          fs.SizeSuffix        `config:"chunk_size"`
+	DriveID            string               `config:"drive_id"`
+	DriveType          string               `config:"drive_type"`
+	ExposeOneNoteFiles bool                 `config:"expose_onenote_files"`
+	Enc                encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote one drive
@@ -335,13 +381,30 @@ var retryErrorCodes = []int{
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
 func shouldRetry(resp *http.Response, err error) (bool, error) {
-	authRetry := false
-
-	if resp != nil && resp.StatusCode == 401 && len(resp.Header["Www-Authenticate"]) == 1 && strings.Index(resp.Header["Www-Authenticate"][0], "expired_token") >= 0 {
-		authRetry = true
-		fs.Debugf(nil, "Should retry: %v", err)
+	retry := false
+	if resp != nil {
+		switch resp.StatusCode {
+		case 401:
+			if len(resp.Header["Www-Authenticate"]) == 1 && strings.Index(resp.Header["Www-Authenticate"][0], "expired_token") >= 0 {
+				retry = true
+				fs.Debugf(nil, "Should retry: %v", err)
+			}
+		case 429: // Too Many Requests.
+			// see https://docs.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online
+			if values := resp.Header["Retry-After"]; len(values) == 1 && values[0] != "" {
+				retryAfter, parseErr := strconv.Atoi(values[0])
+				if parseErr != nil {
+					fs.Debugf(nil, "Failed to parse Retry-After: %q: %v", values[0], parseErr)
+				} else {
+					duration := time.Second * time.Duration(retryAfter)
+					retry = true
+					err = pacer.RetryAfterError(err, duration)
+					fs.Debugf(nil, "Too many requests. Trying again in %d seconds.", retryAfter)
+				}
+			}
+		}
 	}
-	return authRetry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+	return retry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
 // readMetaDataForPathRelativeToID reads the metadata for a path relative to an item that is addressed by its normalized ID.
@@ -351,8 +414,13 @@ func shouldRetry(resp *http.Response, err error) (bool, error) {
 // instead of simply using `drives/driveID/root:/itemPath` because it works for
 // "shared with me" folders in OneDrive Personal (See #2536, #2778)
 // This path pattern comes from https://github.com/OneDrive/onedrive-api-docs/issues/908#issuecomment-417488480
+//
+// If `relPath` == '', do not append the slash (See #3664)
 func (f *Fs) readMetaDataForPathRelativeToID(ctx context.Context, normalizedID string, relPath string) (info *api.Item, resp *http.Response, err error) {
-	opts := newOptsCall(normalizedID, "GET", ":/"+withTrailingColon(rest.URLPathEscape(enc.FromStandardPath(relPath))))
+	if relPath != "" {
+		relPath = "/" + withTrailingColon(rest.URLPathEscape(f.opt.Enc.FromStandardPath(relPath)))
+	}
+	opts := newOptsCall(normalizedID, "GET", ":"+relPath)
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
 		return shouldRetry(resp, err)
@@ -375,7 +443,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 		} else {
 			opts = rest.Opts{
 				Method: "GET",
-				Path:   "/root:/" + rest.URLPathEscape(enc.FromStandardPath(path)),
+				Path:   "/root:/" + rest.URLPathEscape(f.opt.Enc.FromStandardPath(path)),
 			}
 		}
 		err = f.pacer.Call(func() (bool, error) {
@@ -623,7 +691,7 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, leaf string) (newID string, e
 	var info *api.Item
 	opts := newOptsCall(dirID, "POST", "/children")
 	mkdir := api.CreateItemRequest{
-		Name:             enc.FromStandardName(leaf),
+		Name:             f.opt.Enc.FromStandardName(leaf),
 		ConflictBehavior: "fail",
 	}
 	err = f.pacer.Call(func() (bool, error) {
@@ -683,7 +751,7 @@ OUTER:
 			if item.Deleted != nil {
 				continue
 			}
-			item.Name = enc.ToStandardName(item.GetName())
+			item.Name = f.opt.Enc.ToStandardName(item.GetName())
 			if fn(item) {
 				found = true
 				break OUTER
@@ -939,7 +1007,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	id, dstDriveID, _ := parseNormalizedID(directoryID)
 
-	replacedLeaf := enc.FromStandardName(leaf)
+	replacedLeaf := f.opt.Enc.FromStandardName(leaf)
 	copyReq := api.CopyItemRequest{
 		Name: &replacedLeaf,
 		ParentReference: api.ItemReference{
@@ -1023,7 +1091,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	opts := newOptsCall(srcObj.id, "PATCH", "")
 
 	move := api.MoveItemRequest{
-		Name: enc.FromStandardName(leaf),
+		Name: f.opt.Enc.FromStandardName(leaf),
 		ParentReference: &api.ItemReference{
 			DriveID: dstDriveID,
 			ID:      id,
@@ -1138,7 +1206,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// Do the move
 	opts := newOptsCall(srcID, "PATCH", "")
 	move := api.MoveItemRequest{
-		Name: enc.FromStandardName(leaf),
+		Name: f.opt.Enc.FromStandardName(leaf),
 		ParentReference: &api.ItemReference{
 			DriveID: dstDriveID,
 			ID:      parsedDstDirID,
@@ -1260,7 +1328,7 @@ func (o *Object) rootPath() string {
 
 // srvPath returns a path for use in server given a remote
 func (f *Fs) srvPath(remote string) string {
-	return enc.FromStandardPath(f.rootSlash() + remote)
+	return f.opt.Enc.FromStandardPath(f.rootSlash() + remote)
 }
 
 // srvPath returns a path for use in server
@@ -1372,7 +1440,7 @@ func (o *Object) setModTime(ctx context.Context, modTime time.Time) (*api.Item, 
 		opts = rest.Opts{
 			Method:  "PATCH",
 			RootURL: rootURL,
-			Path:    "/" + drive + "/items/" + trueDirID + ":/" + withTrailingColon(rest.URLPathEscape(enc.FromStandardName(leaf))),
+			Path:    "/" + drive + "/items/" + trueDirID + ":/" + withTrailingColon(rest.URLPathEscape(o.fs.opt.Enc.FromStandardName(leaf))),
 		}
 	} else {
 		opts = rest.Opts{
@@ -1447,7 +1515,7 @@ func (o *Object) createUploadSession(ctx context.Context, modTime time.Time) (re
 			Method:  "POST",
 			RootURL: rootURL,
 			Path: fmt.Sprintf("/%s/items/%s:/%s:/createUploadSession",
-				drive, id, rest.URLPathEscape(enc.FromStandardName(leaf))),
+				drive, id, rest.URLPathEscape(o.fs.opt.Enc.FromStandardName(leaf))),
 		}
 	} else {
 		opts = rest.Opts{
@@ -1599,7 +1667,7 @@ func (o *Object) uploadSinglepart(ctx context.Context, in io.Reader, size int64,
 		opts = rest.Opts{
 			Method:        "PUT",
 			RootURL:       rootURL,
-			Path:          "/" + drive + "/items/" + trueDirID + ":/" + rest.URLPathEscape(enc.FromStandardName(leaf)) + ":/content",
+			Path:          "/" + drive + "/items/" + trueDirID + ":/" + rest.URLPathEscape(o.fs.opt.Enc.FromStandardName(leaf)) + ":/content",
 			ContentLength: &size,
 			Body:          in,
 		}

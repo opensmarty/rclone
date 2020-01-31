@@ -115,14 +115,6 @@ func TestCRUD(t *testing.T) {
 	assert.Equal(t, "true", FileGet("asdf", "bool"))
 	assert.Equal(t, "secret", obscure.MustReveal(FileGet("asdf", "pass")))
 
-	// no-op rename, asdf → asdf
-	RenameRemote("asdf")
-
-	assert.Equal(t, []string{"asdf"}, configFile.GetSectionList())
-	assert.Equal(t, "config_test_remote", FileGet("asdf", "type"))
-	assert.Equal(t, "true", FileGet("asdf", "bool"))
-	assert.Equal(t, "secret", obscure.MustReveal(FileGet("asdf", "pass")))
-
 	// delete remote
 	DeleteRemote("asdf")
 	assert.Equal(t, []string{}, configFile.GetSectionList())
@@ -161,6 +153,28 @@ func TestChooseOption(t *testing.T) {
 
 	assert.Equal(t, "true", FileGet("test", "bool"))
 	assert.Equal(t, "", FileGet("test", "pass"))
+}
+
+func TestNewRemoteName(t *testing.T) {
+	defer testConfigFile(t, "crud.conf")()
+
+	// script for creating remote
+	ReadLine = makeReadLine([]string{
+		"config_test_remote", // type
+		"true",               // bool value
+		"n",                  // not required
+		"y",                  // looks good, save
+	})
+	NewRemote("test")
+
+	ReadLine = makeReadLine([]string{
+		"test",           // already exists
+		"",               // empty string not allowed
+		"bad@characters", // bad characters
+		"newname",        // OK
+	})
+
+	assert.Equal(t, "newname", NewRemoteName())
 }
 
 func TestCreateUpatePasswordRemote(t *testing.T) {
@@ -254,6 +268,53 @@ func TestConfigLoadEncrypted(t *testing.T) {
 	keys := c.GetKeyList("nounc")
 	expect = []string{"type", "nounc"}
 	assert.Equal(t, expect, keys)
+}
+
+func TestConfigLoadEncryptedWithValidPassCommand(t *testing.T) {
+	oldConfigPath := ConfigPath
+	oldConfig := fs.Config
+	ConfigPath = "./testdata/encrypted.conf"
+	// using fs.Config.PasswordCommand, correct password
+	fs.Config.PasswordCommand = fs.SpaceSepList{"echo", "asdf"}
+	defer func() {
+		ConfigPath = oldConfigPath
+		configKey = nil // reset password
+		fs.Config = oldConfig
+		fs.Config.PasswordCommand = nil
+	}()
+
+	configKey = nil // reset password
+
+	c, err := loadConfigFile()
+	require.NoError(t, err)
+
+	sections := c.GetSectionList()
+	var expect = []string{"nounc", "unc"}
+	assert.Equal(t, expect, sections)
+
+	keys := c.GetKeyList("nounc")
+	expect = []string{"type", "nounc"}
+	assert.Equal(t, expect, keys)
+}
+
+func TestConfigLoadEncryptedWithInvalidPassCommand(t *testing.T) {
+	oldConfigPath := ConfigPath
+	oldConfig := fs.Config
+	ConfigPath = "./testdata/encrypted.conf"
+	// using fs.Config.PasswordCommand, incorrect password
+	fs.Config.PasswordCommand = fs.SpaceSepList{"echo", "asdf-blurfl"}
+	defer func() {
+		ConfigPath = oldConfigPath
+		configKey = nil // reset password
+		fs.Config = oldConfig
+		fs.Config.PasswordCommand = nil
+	}()
+
+	configKey = nil // reset password
+
+	_, err := loadConfigFile()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "using --password-command derived password")
 }
 
 func TestConfigLoadEncryptedFailures(t *testing.T) {

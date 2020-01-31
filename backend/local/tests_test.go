@@ -54,7 +54,7 @@ var testsWindows = [][2]string{
 	{`\\?\UNC\theserver\dir\file.txt`, `\\?\UNC\theserver\dir\file.txt`},
 	{`//?/UNC/theserver/dir\file.txt`, `\\?\UNC\theserver\dir\file.txt`},
 	{`c:/temp`, `c:\temp`},
-	{`/temp/file.txt`, `\temp\file.txt`},
+	{`C:/temp/file.txt`, `C:\temp\file.txt`},
 	{`c:\!\"#¤%&/()=;:*^?+-`, `c:\!\＂#¤%&\()=;：＊^？+-`},
 	{`c:\<>"|?*:&\<>"|?*:&\<>"|?*:&`, `c:\＜＞＂｜？＊：&\＜＞＂｜？＊：&\＜＞＂｜？＊：&`},
 }
@@ -64,7 +64,7 @@ func TestCleanWindows(t *testing.T) {
 		t.Skipf("windows only")
 	}
 	for _, test := range testsWindows {
-		got := cleanRootPath(test[0], true)
+		got := cleanRootPath(test[0], true, defaultEnc)
 		expect := test[1]
 		if got != expect {
 			t.Fatalf("got %q, expected %q", got, expect)

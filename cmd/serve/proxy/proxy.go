@@ -3,6 +3,8 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"os/exec"
 	"strings"
@@ -16,7 +18,6 @@ import (
 	libcache "github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfsflags"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // Help contains text describing how to use the proxy
@@ -107,8 +108,8 @@ type Proxy struct {
 
 // cacheEntry is what is stored in the vfsCache
 type cacheEntry struct {
-	vfs    *vfs.VFS // stored VFS
-	pwHash []byte   // bcrypt hash of the password
+	vfs    *vfs.VFS          // stored VFS
+	pwHash [sha256.Size]byte // sha256 hash of the password/publicKey
 }
 
 // New creates a new proxy with the Options passed in
@@ -162,12 +163,21 @@ func (p *Proxy) run(in map[string]string) (config configmap.Simple, err error) {
 }
 
 // call runs the auth proxy and returns a cacheEntry and an error
-func (p *Proxy) call(user, pass string, passwordBytes []byte) (value interface{}, err error) {
+func (p *Proxy) call(user, auth string, isPublicKey bool) (value interface{}, err error) {
+	var config configmap.Simple
 	// Contact the proxy
-	config, err := p.run(map[string]string{
-		"user": user,
-		"pass": pass,
-	})
+	if isPublicKey {
+		config, err = p.run(map[string]string{
+			"user":       user,
+			"public_key": auth,
+		})
+	} else {
+		config, err = p.run(map[string]string{
+			"user": user,
+			"pass": auth,
+		})
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -208,13 +218,13 @@ func (p *Proxy) call(user, pass string, passwordBytes []byte) (value interface{}
 		if err != nil {
 			return nil, false, err
 		}
-		pwHash, err := bcrypt.GenerateFromPassword(passwordBytes, bcrypt.DefaultCost)
-		if err != nil {
-			return nil, false, err
-		}
+
+		// We hash the auth here so we don't copy the auth more than we
+		// need to in memory. An attacker would find it easier to go
+		// after the unencrypted password in memory most likely.
 		entry := cacheEntry{
 			vfs:    vfs.New(f, &vfsflags.Opt),
-			pwHash: pwHash,
+			pwHash: sha256.Sum256([]byte(auth)),
 		}
 		return entry, true, nil
 	})
@@ -224,17 +234,15 @@ func (p *Proxy) call(user, pass string, passwordBytes []byte) (value interface{}
 	return value, nil
 }
 
-// Call runs the auth proxy with the given input, returning a *vfs.VFS
-// and the key used in the VFS cache.
-func (p *Proxy) Call(user, pass string) (VFS *vfs.VFS, vfsKey string, err error) {
-	var passwordBytes = []byte(pass)
-
+// Call runs the auth proxy with the username and password/public key provided
+// returning a *vfs.VFS and the key used in the VFS cache.
+func (p *Proxy) Call(user, auth string, isPublicKey bool) (VFS *vfs.VFS, vfsKey string, err error) {
 	// Look in the cache first
 	value, ok := p.vfsCache.GetMaybe(user)
 
 	// If not found then call the proxy for a fresh answer
 	if !ok {
-		value, err = p.call(user, pass, passwordBytes)
+		value, err = p.call(user, auth, isPublicKey)
 		if err != nil {
 			return nil, "", err
 		}
@@ -246,14 +254,17 @@ func (p *Proxy) Call(user, pass string) (VFS *vfs.VFS, vfsKey string, err error)
 		return nil, "", errors.Errorf("proxy: value is not cache entry: %#v", value)
 	}
 
-	// Check the password is correct in the cached entry.  This
+	// Check the password / public key is correct in the cached entry.  This
 	// prevents an attack where subsequent requests for the same
 	// user don't have their auth checked. It does mean that if
 	// the password is changed, the user will have to wait for
 	// cache expiry (5m) before trying again.
-	err = bcrypt.CompareHashAndPassword(entry.pwHash, passwordBytes)
-	if err != nil {
-		return nil, "", errors.Wrap(err, "proxy: incorrect password")
+	authHash := sha256.Sum256([]byte(auth))
+	if subtle.ConstantTimeCompare(authHash[:], entry.pwHash[:]) != 1 {
+		if isPublicKey {
+			return nil, "", errors.New("proxy: incorrect public key")
+		}
+		return nil, "", errors.New("proxy: incorrect password")
 	}
 
 	return entry.vfs, user, nil
